@@ -77,6 +77,6 @@ func NewCustomClient(cfg TransportConfig) *http.Client {
 
 	return &http.Client{
 		Transport: rt,
-		Timeout:   60 * time.Second,
+		Timeout:   300 * time.Second,
 	}
 }

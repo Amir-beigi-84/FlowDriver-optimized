@@ -74,7 +74,7 @@ func (v *VirtualConn) Close() error {
 	v.session.closed = true
 	v.session.txCond.Broadcast() // Wake up any writers blocked on backpressure
 	v.session.mu.Unlock()
-	
+
 	// A closed connection no longer accepts writes efficiently
 	// Next periodic engine flush will securely remove context
 	return nil

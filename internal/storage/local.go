@@ -42,7 +42,7 @@ func (b *LocalBackend) Upload(ctx context.Context, filename string, data io.Read
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %w", err)
 	}
-	
+
 	if _, err := io.Copy(f, data); err != nil {
 		f.Close()
 		os.Remove(tmpPath)

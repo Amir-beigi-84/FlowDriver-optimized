@@ -8,3 +8,14 @@ bin/
 *.json
 *.log
 *.token
+# Local credentials / secrets
+credentials*.json
+*.token
+client-me.json
+client-me.backup.json
+
+# Local secrets and machine-specific config
+credentials*.json
+*.token
+client-me.json
+client-me.backup.json
