@@ -275,42 +275,74 @@ func (b *GoogleBackend) ListQuery(ctx context.Context, prefix string) ([]string,
 		return nil, err
 	}
 
-	q := fmt.Sprintf("name contains '%s'", prefix)
+	q := fmt.Sprintf("name contains %s and trashed = false", driveQueryLiteral(prefix))
 	if b.folderID != "" {
-		q += fmt.Sprintf(" and '%s' in parents", b.folderID)
+		q += fmt.Sprintf(" and %s in parents", driveQueryLiteral(b.folderID))
 	}
 
-	u, _ := url.Parse("https://www.googleapis.com/drive/v3/files")
-	v := u.Query()
-	v.Set("q", q)
-	v.Set("fields", "files(id, name)")
-	u.RawQuery = v.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+tok)
-
-	resp, err := b.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("list returned %d: %s", resp.StatusCode, string(body))
+	type listedFile struct {
+		name string
+		id   string
 	}
 
-	var resData struct {
-		Files []struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-		} `json:"files"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&resData); err != nil {
-		return nil, err
+	var names []string
+	var matched []listedFile
+	pageToken := ""
+	for {
+		u, _ := url.Parse("https://www.googleapis.com/drive/v3/files")
+		v := u.Query()
+		v.Set("q", q)
+		v.Set("fields", "nextPageToken,files(id,name,size,createdTime)")
+		v.Set("pageSize", "100")
+		if pageToken != "" {
+			v.Set("pageToken", pageToken)
+		}
+		u.RawQuery = v.Encode()
+
+		req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+
+		resp, err := b.httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return nil, fmt.Errorf("list returned %d: %s", resp.StatusCode, string(body))
+		}
+
+		var resData struct {
+			NextPageToken string `json:"nextPageToken"`
+			Files         []struct {
+				ID          string `json:"id"`
+				Name        string `json:"name"`
+				Size        string `json:"size"`
+				CreatedTime string `json:"createdTime"`
+			} `json:"files"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&resData); err != nil {
+			resp.Body.Close()
+			return nil, err
+		}
+		resp.Body.Close()
+
+		for _, f := range resData.Files {
+			// Keep exact prefix validation client-side because Drive only supports contains.
+			if strings.HasPrefix(f.Name, prefix) {
+				matched = append(matched, listedFile{name: f.Name, id: f.ID})
+				names = append(names, f.Name)
+			}
+		}
+
+		if resData.NextPageToken == "" {
+			break
+		}
+		pageToken = resData.NextPageToken
 	}
 
 	b.fileIdsMu.Lock()
@@ -318,18 +350,18 @@ func (b *GoogleBackend) ListQuery(ctx context.Context, prefix string) ([]string,
 	if len(b.fileIDs) > 2000 {
 		b.fileIDs = make(map[string]string)
 	}
-
-	var names []string
-	for _, f := range resData.Files {
-		// Only collect exact prefix matches client-side just in case
-		if strings.HasPrefix(f.Name, prefix) {
-			b.fileIDs[f.Name] = f.ID
-			names = append(names, f.Name)
-		}
+	for _, f := range matched {
+		b.fileIDs[f.name] = f.id
 	}
 	b.fileIdsMu.Unlock()
 
 	return names, nil
+}
+
+func driveQueryLiteral(s string) string {
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "'", "\\'")
+	return "'" + s + "'"
 }
 
 func (b *GoogleBackend) Download(ctx context.Context, filename string) (io.ReadCloser, error) {
