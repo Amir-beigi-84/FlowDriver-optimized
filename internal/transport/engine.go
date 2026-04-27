@@ -111,7 +111,7 @@ func NewEngine(backend storage.Backend, isClient bool, clientID string) *Engine 
 		flushTicker:      300 * time.Millisecond,
 		flushNow:         make(chan struct{}, 1),
 		pollNow:          make(chan struct{}, 1),
-		flushCoalesce:    20 * time.Millisecond,
+		flushCoalesce:    10 * time.Millisecond,
 	}
 	if isClient {
 		e.myDir = DirReq
@@ -169,6 +169,12 @@ func (e *Engine) SetAdaptivePoll(idleMs, activeMs, activeWindowMs int) {
 func (e *Engine) SetFlushRate(ms int) {
 	if ms > 0 {
 		e.flushTicker = time.Duration(ms) * time.Millisecond
+	}
+}
+
+func (e *Engine) SetFlushCoalesce(ms int) {
+	if ms > 0 {
+		e.flushCoalesce = time.Duration(ms) * time.Millisecond
 	}
 }
 

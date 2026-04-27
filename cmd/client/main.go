@@ -104,6 +104,9 @@ func main() {
 	if appCfg.FlushRateMs > 0 {
 		engine.SetFlushRate(appCfg.FlushRateMs)
 	}
+	if appCfg.FlushCoalesceMs > 0 {
+		engine.SetFlushCoalesce(appCfg.FlushCoalesceMs)
+	}
 	engine.Start(ctx)
 
 	// Start metrics logging if configured

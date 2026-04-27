@@ -40,6 +40,9 @@ type AppConfig struct {
 	// FlushRateMs is the gathering (TX) interval in milliseconds for the engine.
 	FlushRateMs int `json:"flush_rate_ms,omitempty"`
 
+	// FlushCoalesceMs is the short write-burst coalescing delay before event-driven flush.
+	FlushCoalesceMs int `json:"flush_coalesce_ms,omitempty"`
+
 	// MetricsLogIntervalSec is the interval for periodic metrics logging (0 = disabled).
 	MetricsLogIntervalSec int `json:"metrics_log_interval_sec,omitempty"`
 
