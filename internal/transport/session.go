@@ -19,6 +19,7 @@ type Session struct {
 	mu           sync.Mutex
 	txBuf        []byte
 	txSeq        uint64
+	txInFlight   bool
 	rxSeq        uint64
 	rxQueue      map[uint64]*Envelope
 	lastActivity time.Time
@@ -62,6 +63,7 @@ func (s *Session) EnqueueTx(data []byte) {
 func (s *Session) ClearTx() {
 	s.mu.Lock()
 	s.txBuf = nil
+	s.txInFlight = false
 	s.txCond.Broadcast() // Wake up any writers blocked on backpressure
 	s.mu.Unlock()
 }

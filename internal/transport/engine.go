@@ -13,6 +13,42 @@ import (
 	"github.com/NullLatency/flow-driver/internal/storage"
 )
 
+type txSnapshot struct {
+	session *Session
+	payload []byte
+	closed  bool
+}
+
+func (snap txSnapshot) commit() (removeSession bool, hasMoreData bool) {
+	s := snap.session
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.txSeq++
+	s.txInFlight = false
+	s.txCond.Broadcast()
+
+	return snap.closed, len(s.txBuf) > 0
+}
+
+func (snap txSnapshot) rollback() {
+	s := snap.session
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(snap.payload) > 0 {
+		restored := make([]byte, 0, len(snap.payload)+len(s.txBuf))
+		restored = append(restored, snap.payload...)
+		restored = append(restored, s.txBuf...)
+		s.txBuf = restored
+	}
+
+	s.txInFlight = false
+	s.txCond.Broadcast()
+}
+
 // Engine manages the local sessions, periodically flushes Tx buffers to files,
 // and polls for new Rx files.
 type Engine struct {
@@ -154,7 +190,7 @@ func (e *Engine) flushAll(ctx context.Context) {
 	e.sessionMu.Unlock()
 
 	muxes := make(map[string][]Envelope)
-	var closedSessionIDs []string
+	snapshots := make(map[string][]txSnapshot)
 
 	for _, s := range sessions {
 		s.mu.Lock()
@@ -164,16 +200,21 @@ func (e *Engine) flushAll(ctx context.Context) {
 			s.closed = true
 		}
 
-		shouldSend := len(s.txBuf) > 0 || (s.txSeq == 0 && e.myDir == DirReq) || s.closed
+		if s.txInFlight {
+			s.mu.Unlock()
+			continue
+		}
 
+		shouldSend := len(s.txBuf) > 0 || (s.txSeq == 0 && e.myDir == DirReq) || s.closed
 		if !shouldSend {
 			s.mu.Unlock()
 			continue
 		}
 
-		payload := s.txBuf
+		payload := append([]byte(nil), s.txBuf...)
 		s.txBuf = nil
-		s.txCond.Broadcast() // Release any blocked writers
+		s.txInFlight = true
+		s.txCond.Broadcast()
 
 		env := Envelope{
 			SessionID:  s.ID,
@@ -183,56 +224,76 @@ func (e *Engine) flushAll(ctx context.Context) {
 			TargetAddr: s.TargetAddr,
 		}
 
-		s.txSeq++
-		if s.closed {
-			closedSessionIDs = append(closedSessionIDs, s.ID)
-		}
-
 		cid := s.ClientID
 		if cid == "" && e.myDir == DirReq {
 			cid = e.id // For client requests, use our own ID
 		}
+		if cid == "" {
+			cid = "unknown"
+		}
 
 		muxes[cid] = append(muxes[cid], env)
+		snapshots[cid] = append(snapshots[cid], txSnapshot{
+			session: s,
+			payload: payload,
+			closed:  s.closed,
+		})
+
 		s.mu.Unlock()
 	}
 
-	if len(muxes) > 0 {
-		// log.Printf("Engine.flushAll: Prepared muxes for %d clients", len(muxes))
-	}
-
 	for cid, mux := range muxes {
-		// Filename format: {dir}-{clientID}-mux-{timestamp}.bin
-		fnameCID := cid
-		if fnameCID == "" {
-			fnameCID = "unknown"
-		}
-		filename := fmt.Sprintf("%s-%s-mux-%d.bin", e.myDir, fnameCID, time.Now().UnixNano())
+		filename := fmt.Sprintf("%s-%s-mux-%d.bin", e.myDir, cid, time.Now().UnixNano())
+		go e.uploadMux(ctx, filename, mux, snapshots[cid])
+	}
+}
 
-		// Upload asynchronously with backpressure/limit
-		go func(fname string, m []Envelope) {
-			e.sem <- struct{}{}        // Acquire
-			defer func() { <-e.sem }() // Release
+func (e *Engine) uploadMux(ctx context.Context, filename string, mux []Envelope, snapshots []txSnapshot) {
+	e.sem <- struct{}{}
+	defer func() { <-e.sem }()
 
-			pr, pw := io.Pipe()
-			go func() {
-				defer pw.Close()
-				for _, env := range m {
-					if err := env.Encode(pw); err != nil {
-						log.Printf("mux encode error: %v", err)
-						break
-					}
-				}
-			}()
+	pr, pw := io.Pipe()
 
-			if err := e.backend.Upload(ctx, fname, pr); err != nil {
-				log.Printf("upload error %s: %v", fname, err)
+	go func() {
+		for _, env := range mux {
+			if err := env.Encode(pw); err != nil {
+				_ = pw.CloseWithError(err)
+				log.Printf("mux encode error %s: %v", filename, err)
+				return
 			}
-		}(filename, mux)
+		}
+
+		_ = pw.Close()
+	}()
+
+	if err := e.backend.Upload(ctx, filename, pr); err != nil {
+		log.Printf("upload error %s: %v", filename, err)
+
+		for _, snap := range snapshots {
+			snap.rollback()
+		}
+
+		e.RequestFlush()
+		return
 	}
 
-	for _, id := range closedSessionIDs {
-		e.RemoveSession(id)
+	hasMoreData := false
+
+	for _, snap := range snapshots {
+		removeSession, moreData := snap.commit()
+
+		if removeSession {
+			e.RemoveSession(snap.session.ID)
+			continue
+		}
+
+		if moreData {
+			hasMoreData = true
+		}
+	}
+
+	if hasMoreData {
+		e.RequestFlush()
 	}
 }
 
