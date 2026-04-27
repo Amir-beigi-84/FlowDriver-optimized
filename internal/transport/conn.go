@@ -65,6 +65,7 @@ func (v *VirtualConn) Read(b []byte) (n int, err error) {
 func (v *VirtualConn) Write(b []byte) (n int, err error) {
 	if len(b) > 0 {
 		v.session.EnqueueTx(b)
+		v.engine.RequestFlush()
 	}
 	return len(b), nil
 }

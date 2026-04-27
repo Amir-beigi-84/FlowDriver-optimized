@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/NullLatency/flow-driver/internal/config"
 	"github.com/NullLatency/flow-driver/internal/httpclient"
@@ -95,15 +96,16 @@ func main() {
 }
 
 func handleServerConn(sessionID, targetAddr string, session *transport.Session, engine *transport.Engine) {
-	defer engine.RemoveSession(sessionID)
+	defer engine.CloseSession(sessionID)
 
-	conn, err := net.Dial("tcp", targetAddr)
+	conn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
 	if err != nil {
 		log.Printf("Dial error to %s: %v", targetAddr, err)
-		// Send back a close packet? Just closing the session will notify client
 		return
 	}
 	defer conn.Close()
+
+	log.Printf("Server connected target: session=%s target=%s", sessionID, targetAddr)
 
 	errCh := make(chan error, 2)
 
@@ -113,7 +115,9 @@ func handleServerConn(sessionID, targetAddr string, session *transport.Session, 
 		for {
 			n, err := conn.Read(buf)
 			if n > 0 {
+				log.Printf("Server target -> tunnel: session=%s bytes=%d", sessionID, n)
 				session.EnqueueTx(buf[:n])
+				engine.RequestFlush()
 			}
 			if err != nil {
 				errCh <- err
@@ -131,6 +135,7 @@ func handleServerConn(sessionID, targetAddr string, session *transport.Session, 
 				return
 			}
 			if len(data) > 0 {
+				log.Printf("Server tunnel -> target: session=%s bytes=%d", sessionID, len(data))
 				if _, err := conn.Write(data); err != nil {
 					errCh <- err
 					return

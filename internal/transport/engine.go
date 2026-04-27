@@ -31,6 +31,9 @@ type Engine struct {
 	pollTicker  time.Duration
 	flushTicker time.Duration
 
+	flushNow      chan struct{}
+	flushCoalesce time.Duration
+
 	// Server mode handler: called when a new session is discovered
 	OnNewSession func(sessionID, targetAddr string, s *Session)
 
@@ -50,8 +53,10 @@ func NewEngine(backend storage.Backend, isClient bool, clientID string) *Engine 
 		closedSessions: make(map[string]time.Time),
 		processed:      make(map[string]bool),
 		// Default intervals: Poll (RX) fast for responsiveness, Flush (TX) slower for gathering
-		pollTicker:  500 * time.Millisecond,
-		flushTicker: 300 * time.Millisecond,
+		pollTicker:    500 * time.Millisecond,
+		flushTicker:   300 * time.Millisecond,
+		flushNow:      make(chan struct{}, 1),
+		flushCoalesce: 20 * time.Millisecond,
 	}
 	if isClient {
 		e.myDir = DirReq
@@ -106,6 +111,13 @@ func (e *Engine) AddSession(s *Session) {
 	log.Printf("Engine.AddSession: Added session %s (Total now: %d)", s.ID, len(e.sessions))
 }
 
+func (e *Engine) RequestFlush() {
+	select {
+	case e.flushNow <- struct{}{}:
+	default:
+	}
+}
+
 func (e *Engine) flushLoop(ctx context.Context) {
 	ticker := time.NewTicker(e.flushTicker)
 	defer ticker.Stop()
@@ -114,7 +126,20 @@ func (e *Engine) flushLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+
 		case <-ticker.C:
+			e.flushAll(ctx)
+
+		case <-e.flushNow:
+			timer := time.NewTimer(e.flushCoalesce)
+
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+
 			e.flushAll(ctx)
 		}
 	}
@@ -379,6 +404,23 @@ func (e *Engine) pollLoop(ctx context.Context) {
 			goto pollAgain
 		}
 	}
+}
+
+func (e *Engine) CloseSession(id string) {
+	e.sessionMu.RLock()
+	s := e.sessions[id]
+	e.sessionMu.RUnlock()
+
+	if s == nil {
+		return
+	}
+
+	s.mu.Lock()
+	s.closed = true
+	s.txCond.Broadcast()
+	s.mu.Unlock()
+
+	e.RequestFlush()
 }
 
 func (e *Engine) RemoveSession(id string) {
