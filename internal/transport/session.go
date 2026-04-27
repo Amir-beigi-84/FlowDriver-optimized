@@ -31,16 +31,20 @@ type Session struct {
 	// Backpressure: blocked when txBuf is too large
 	txCond *sync.Cond
 
+	// First-write optimization: delay empty open packet
+	firstWritePending bool
+
 	// App channel for receiving data downloaded from remote
 	RxChan chan []byte
 }
 
 func NewSession(id string) *Session {
 	s := &Session{
-		ID:           id,
-		rxQueue:      make(map[uint64]*Envelope),
-		lastActivity: time.Now(),
-		RxChan:       make(chan []byte, 1024),
+		ID:                id,
+		rxQueue:           make(map[uint64]*Envelope),
+		lastActivity:      time.Now(),
+		firstWritePending: true,
+		RxChan:            make(chan []byte, 1024),
 	}
 	s.txCond = sync.NewCond(&s.mu)
 	return s
@@ -58,6 +62,7 @@ func (s *Session) EnqueueTx(data []byte) {
 
 	s.txBuf = append(s.txBuf, data...)
 	s.lastActivity = time.Now()
+	s.firstWritePending = false
 }
 
 func (s *Session) ClearTx() {

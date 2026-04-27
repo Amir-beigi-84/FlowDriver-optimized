@@ -128,9 +128,6 @@ func main() {
 			session.TargetAddr = addr
 			engine.AddSession(session)
 
-			// Instantly ping a blank payload so the remote end opens the actual TCP destination
-			session.EnqueueTx(nil)
-
 			return transport.NewVirtualConn(session, engine), nil
 		}),
 		socks5.WithAssociateHandle(func(ctx context.Context, w io.Writer, req *socks5.Request) error {

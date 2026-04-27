@@ -67,6 +67,10 @@ type Engine struct {
 	pollTicker  time.Duration
 	flushTicker time.Duration
 
+	// Adaptive polling: fast when active, slow when idle
+	pollTickerIdle   time.Duration
+	pollTickerActive time.Duration
+
 	flushNow      chan struct{}
 	flushCoalesce time.Duration
 
@@ -79,6 +83,8 @@ type Engine struct {
 	// Track processed files to avoid duplicates
 	processed   map[string]bool
 	processedMu sync.Mutex
+
+	wg sync.WaitGroup
 }
 
 func NewEngine(backend storage.Backend, isClient bool, clientID string) *Engine {
@@ -88,11 +94,13 @@ func NewEngine(backend storage.Backend, isClient bool, clientID string) *Engine 
 		sessions:       make(map[string]*Session),
 		closedSessions: make(map[string]time.Time),
 		processed:      make(map[string]bool),
-		// Default intervals: Poll (RX) fast for responsiveness, Flush (TX) slower for gathering
-		pollTicker:    500 * time.Millisecond,
-		flushTicker:   300 * time.Millisecond,
-		flushNow:      make(chan struct{}, 1),
-		flushCoalesce: 20 * time.Millisecond,
+		// Default intervals
+		pollTicker:       500 * time.Millisecond,
+		pollTickerIdle:   500 * time.Millisecond,
+		pollTickerActive: 50 * time.Millisecond,
+		flushTicker:      300 * time.Millisecond,
+		flushNow:         make(chan struct{}, 1),
+		flushCoalesce:    20 * time.Millisecond,
 	}
 	if isClient {
 		e.myDir = DirReq
@@ -109,6 +117,8 @@ func NewEngine(backend storage.Backend, isClient bool, clientID string) *Engine 
 func (e *Engine) SetRefreshRate(ms int) {
 	if ms > 0 {
 		e.pollTicker = time.Duration(ms) * time.Millisecond
+		e.pollTickerIdle = time.Duration(ms) * time.Millisecond
+		e.pollTickerActive = time.Duration(ms) / 5 * time.Millisecond
 		// Legacy behavior: sets both if FlushTicker was still at default
 		if e.flushTicker == 300*time.Millisecond {
 			e.flushTicker = time.Duration(ms) * time.Millisecond
@@ -119,6 +129,8 @@ func (e *Engine) SetRefreshRate(ms int) {
 func (e *Engine) SetPollRate(ms int) {
 	if ms > 0 {
 		e.pollTicker = time.Duration(ms) * time.Millisecond
+		e.pollTickerIdle = time.Duration(ms) * time.Millisecond
+		e.pollTickerActive = time.Duration(ms) / 5 * time.Millisecond
 	}
 }
 
@@ -205,7 +217,18 @@ func (e *Engine) flushAll(ctx context.Context) {
 			continue
 		}
 
-		shouldSend := len(s.txBuf) > 0 || (s.txSeq == 0 && e.myDir == DirReq) || s.closed
+		// Decide if we should send a packet
+		shouldSend := false
+		if len(s.txBuf) > 0 {
+			shouldSend = true
+		} else if s.closed {
+			shouldSend = true
+		} else if s.txSeq == 0 && e.myDir == DirReq {
+			// Only send empty open if first write hasn't arrived within delay window
+			if !s.firstWritePending || time.Since(s.lastActivity) > 25*time.Millisecond {
+				shouldSend = true
+			}
+		}
 		if !shouldSend {
 			s.mu.Unlock()
 			continue
@@ -346,13 +369,13 @@ func (e *Engine) pollLoop(ctx context.Context) {
 
 					if activeSessions == 0 {
 						// Increase polling delay step-by-step to save API calls
-						currentPollInterval += 500 * time.Millisecond
+						currentPollInterval = e.pollTickerIdle
 						if currentPollInterval > maxPollInterval {
 							currentPollInterval = maxPollInterval
 						}
 					} else {
 						// A session is currently active, so loop fast!
-						currentPollInterval = e.pollTicker
+						currentPollInterval = e.pollTickerActive
 					}
 				}
 				// Client optimization doesn't change intervals, but needs its timer reset
@@ -361,7 +384,7 @@ func (e *Engine) pollLoop(ctx context.Context) {
 			}
 
 			// We found data! Reset polling back to maximum speed
-			currentPollInterval = e.pollTicker
+			currentPollInterval = e.pollTickerActive
 
 			// We found files! Let's download them in parallel to boost speed massively
 			var wg sync.WaitGroup
@@ -461,12 +484,14 @@ func (e *Engine) pollLoop(ctx context.Context) {
 
 			// Adaptive Polling: Because we just received data, the connection is active.
 			// Instead of jumping back to the select, immediately poll again after a tiny 100ms break to drain queues.
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(5 * time.Millisecond)
 			goto pollAgain
 		}
 	}
 }
 
+// CloseSession marks session closed and triggers immediate flush.
+// Does not remove session - call RemoveSession after final flush completes.
 func (e *Engine) CloseSession(id string) {
 	e.sessionMu.RLock()
 	s := e.sessions[id]
@@ -482,6 +507,37 @@ func (e *Engine) CloseSession(id string) {
 	s.mu.Unlock()
 
 	e.RequestFlush()
+}
+
+// CloseAndFlush marks session closed, flushes final data, then removes session.
+// Blocks until final flush completes or context cancelled.
+func (e *Engine) CloseAndFlush(ctx context.Context, id string) {
+	e.sessionMu.RLock()
+	s := e.sessions[id]
+	e.sessionMu.RUnlock()
+
+	if s == nil {
+		return
+	}
+
+	s.mu.Lock()
+	s.closed = true
+	s.txCond.Broadcast()
+	s.mu.Unlock()
+
+	// Trigger immediate flush
+	e.RequestFlush()
+
+	// Wait briefly for flush to complete
+	timer := time.NewTimer(500 * time.Millisecond)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+
+	e.RemoveSession(id)
 }
 
 func (e *Engine) RemoveSession(id string) {

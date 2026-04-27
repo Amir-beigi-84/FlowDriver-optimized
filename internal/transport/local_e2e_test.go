@@ -137,7 +137,7 @@ func startTestTarget(t *testing.T) (addr string, stop func()) {
 }
 
 func testProxySession(targetAddr string, session *Session, engine *Engine, errCh chan<- error) {
-	defer engine.CloseSession(session.ID)
+	defer engine.CloseAndFlush(context.Background(), session.ID)
 
 	conn, err := net.DialTimeout("tcp", targetAddr, time.Second)
 	if err != nil {

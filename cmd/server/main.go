@@ -96,7 +96,7 @@ func main() {
 }
 
 func handleServerConn(sessionID, targetAddr string, session *transport.Session, engine *transport.Engine) {
-	defer engine.CloseSession(sessionID)
+	defer engine.CloseAndFlush(context.Background(), sessionID)
 
 	conn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
 	if err != nil {
