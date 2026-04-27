@@ -5,9 +5,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/textproto"
 	"net/url"
@@ -171,13 +174,15 @@ func (b *GoogleBackend) refreshAccessToken(ctx context.Context) error {
 }
 
 func (b *GoogleBackend) executeTokenRequest(ctx context.Context, v url.Values) error {
-	req, err := http.NewRequestWithContext(ctx, "POST", b.tokenURI, strings.NewReader(v.Encode()))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := b.httpClient.Do(req)
+	body := v.Encode()
+	resp, err := b.doHTTPWithRetry(ctx, func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, "POST", b.tokenURI, strings.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		return b.httpClient.Do(req)
+	})
 	if err != nil {
 		return fmt.Errorf("token request failed: %w", err)
 	}
@@ -223,40 +228,54 @@ func (b *GoogleBackend) Upload(ctx context.Context, filename string, data io.Rea
 		return err
 	}
 
-	pr, pw := io.Pipe()
-	metaWriter := multipart.NewWriter(pw)
+	payload, err := io.ReadAll(data)
+	if err != nil {
+		return err
+	}
 
-	go func() {
-		defer pw.Close()
-		defer metaWriter.Close()
+	resp, err := b.doHTTPWithRetry(ctx, func() (*http.Response, error) {
+		var body bytes.Buffer
+		metaWriter := multipart.NewWriter(&body)
 
 		// Part 1: Metadata
 		h := make(textproto.MIMEHeader)
 		h.Set("Content-Type", "application/json; charset=UTF-8")
-		part1, _ := metaWriter.CreatePart(h)
+		part1, err := metaWriter.CreatePart(h)
+		if err != nil {
+			return nil, err
+		}
 		meta := map[string]interface{}{
 			"name": filename,
 		}
 		if b.folderID != "" {
 			meta["parents"] = []string{b.folderID}
 		}
-		json.NewEncoder(part1).Encode(meta)
+		if err := json.NewEncoder(part1).Encode(meta); err != nil {
+			return nil, err
+		}
 
 		// Part 2: Content
 		h = make(textproto.MIMEHeader)
 		h.Set("Content-Type", "application/octet-stream")
-		part2, _ := metaWriter.CreatePart(h)
-		io.Copy(part2, data)
-	}()
+		part2, err := metaWriter.CreatePart(h)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := part2.Write(payload); err != nil {
+			return nil, err
+		}
+		if err := metaWriter.Close(); err != nil {
+			return nil, err
+		}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", pr)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+tok)
-	req.Header.Set("Content-Type", metaWriter.FormDataContentType())
-
-	resp, err := b.httpClient.Do(req)
+		req, err := http.NewRequestWithContext(ctx, "POST", "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", bytes.NewReader(body.Bytes()))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Content-Type", metaWriter.FormDataContentType())
+		return b.httpClient.Do(req)
+	})
 	if err != nil {
 		return err
 	}
@@ -299,13 +318,14 @@ func (b *GoogleBackend) ListQuery(ctx context.Context, prefix string) ([]string,
 		}
 		u.RawQuery = v.Encode()
 
-		req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Authorization", "Bearer "+tok)
-
-		resp, err := b.httpClient.Do(req)
+		resp, err := b.doHTTPWithRetry(ctx, func() (*http.Response, error) {
+			req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
+			if err != nil {
+				return nil, err
+			}
+			req.Header.Set("Authorization", "Bearer "+tok)
+			return b.httpClient.Do(req)
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -378,13 +398,14 @@ func (b *GoogleBackend) Download(ctx context.Context, filename string) (io.ReadC
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://www.googleapis.com/drive/v3/files/"+fileID+"?alt=media", nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+tok)
-
-	resp, err := b.httpClient.Do(req)
+	resp, err := b.doHTTPWithRetry(ctx, func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, "GET", "https://www.googleapis.com/drive/v3/files/"+fileID+"?alt=media", nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+		return b.httpClient.Do(req)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -412,13 +433,14 @@ func (b *GoogleBackend) Delete(ctx context.Context, filename string) error {
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "DELETE", "https://www.googleapis.com/drive/v3/files/"+fileID, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+tok)
-
-	resp, err := b.httpClient.Do(req)
+	resp, err := b.doHTTPWithRetry(ctx, func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, "DELETE", "https://www.googleapis.com/drive/v3/files/"+fileID, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+		return b.httpClient.Do(req)
+	})
 	if err != nil {
 		return err
 	}
@@ -434,6 +456,81 @@ func (b *GoogleBackend) Delete(ctx context.Context, filename string) error {
 	b.fileIdsMu.Unlock()
 
 	return nil
+}
+
+func (b *GoogleBackend) doHTTPWithRetry(ctx context.Context, do func() (*http.Response, error)) (*http.Response, error) {
+	const maxAttempts = 4
+
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		resp, err := do()
+		if !shouldRetryHTTP(resp, err) {
+			return resp, err
+		}
+
+		if attempt == maxAttempts-1 {
+			return resp, err
+		}
+
+		if resp != nil && resp.Body != nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+		}
+		if err != nil {
+			lastErr = err
+		} else if resp != nil {
+			lastErr = fmt.Errorf("transient status %d", resp.StatusCode)
+		}
+
+		delay := retryDelay(attempt)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+
+	return nil, lastErr
+}
+
+func shouldRetryHTTP(resp *http.Response, err error) bool {
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return false
+		}
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return true
+		}
+		msg := strings.ToLower(err.Error())
+		return strings.Contains(msg, "connection reset") ||
+			strings.Contains(msg, "connection refused") ||
+			strings.Contains(msg, "broken pipe") ||
+			strings.Contains(msg, "unexpected eof")
+	}
+	if resp == nil {
+		return false
+	}
+	switch resp.StatusCode {
+	case http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func retryDelay(attempt int) time.Duration {
+	base := 100 * time.Millisecond
+	delay := base << attempt
+	if delay > 2*time.Second {
+		delay = 2 * time.Second
+	}
+	jitter := time.Duration(rand.Int63n(int64(delay / 2)))
+	return delay/2 + jitter
 }
 
 func (b *GoogleBackend) CreateFolder(ctx context.Context, name string) (string, error) {
