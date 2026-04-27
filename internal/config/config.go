@@ -31,6 +31,9 @@ type AppConfig struct {
 	// FlushRateMs is the gathering (TX) interval in milliseconds for the engine.
 	FlushRateMs int `json:"flush_rate_ms,omitempty"`
 
+	// MetricsLogIntervalSec is the interval for periodic metrics logging (0 = disabled).
+	MetricsLogIntervalSec int `json:"metrics_log_interval_sec,omitempty"`
+
 	// Transport configures the dpi-evasion layer.
 	Transport httpclient.TransportConfig `json:"transport,omitempty"`
 }

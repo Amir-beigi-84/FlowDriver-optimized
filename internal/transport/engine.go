@@ -10,13 +10,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/NullLatency/flow-driver/internal/metrics"
 	"github.com/NullLatency/flow-driver/internal/storage"
 )
 
 type txSnapshot struct {
-	session *Session
-	payload []byte
-	closed  bool
+	session    *Session
+	payload    []byte
+	closed     bool
+	enqueuedAt time.Time
 }
 
 func (snap txSnapshot) commit() (removeSession bool, hasMoreData bool) {
@@ -43,6 +45,7 @@ func (snap txSnapshot) rollback() {
 		restored = append(restored, snap.payload...)
 		restored = append(restored, s.txBuf...)
 		s.txBuf = restored
+		s.txEnqueuedAt = snap.enqueuedAt
 	}
 
 	s.txInFlight = false
@@ -156,6 +159,7 @@ func (e *Engine) AddSession(s *Session) {
 	e.sessionMu.Lock()
 	defer e.sessionMu.Unlock()
 	e.sessions[s.ID] = s
+	metrics.Global().SetActiveSessions(int64(len(e.sessions)))
 	log.Printf("Engine.AddSession: Added session %s (Total now: %d)", s.ID, len(e.sessions))
 }
 
@@ -194,6 +198,10 @@ func (e *Engine) flushLoop(ctx context.Context) {
 }
 
 func (e *Engine) flushAll(ctx context.Context) {
+	e.sessionMu.RLock()
+	metrics.Global().SetActiveSessions(int64(len(e.sessions)))
+	e.sessionMu.RUnlock()
+
 	e.sessionMu.Lock()
 	sessions := make([]*Session, 0, len(e.sessions))
 	for _, s := range e.sessions {
@@ -235,7 +243,9 @@ func (e *Engine) flushAll(ctx context.Context) {
 		}
 
 		payload := append([]byte(nil), s.txBuf...)
+		enqueuedAt := s.txEnqueuedAt
 		s.txBuf = nil
+		s.txEnqueuedAt = time.Time{}
 		s.txInFlight = true
 		s.txCond.Broadcast()
 
@@ -257,15 +267,22 @@ func (e *Engine) flushAll(ctx context.Context) {
 
 		muxes[cid] = append(muxes[cid], env)
 		snapshots[cid] = append(snapshots[cid], txSnapshot{
-			session: s,
-			payload: payload,
-			closed:  s.closed,
+			session:    s,
+			payload:    payload,
+			closed:     s.closed,
+			enqueuedAt: enqueuedAt,
 		})
 
 		s.mu.Unlock()
 	}
 
 	for cid, mux := range muxes {
+		var payloadBytes int64
+		for _, env := range mux {
+			payloadBytes += int64(len(env.Payload))
+		}
+		metrics.Global().RecordPayloadBytes(payloadBytes)
+
 		filename := fmt.Sprintf("%s-%s-mux-%d.bin", e.myDir, cid, time.Now().UnixNano())
 		go e.uploadMux(ctx, filename, mux, snapshots[cid])
 	}
@@ -303,6 +320,10 @@ func (e *Engine) uploadMux(ctx context.Context, filename string, mux []Envelope,
 	hasMoreData := false
 
 	for _, snap := range snapshots {
+		if !snap.enqueuedAt.IsZero() {
+			metrics.Global().RecordEnqueueTx(time.Since(snap.enqueuedAt))
+		}
+
 		removeSession, moreData := snap.commit()
 
 		if removeSession {
@@ -360,6 +381,8 @@ func (e *Engine) pollLoop(ctx context.Context) {
 				timer.Reset(currentPollInterval)
 				continue
 			}
+
+			metrics.Global().RecordPoll(len(files))
 
 			if len(files) == 0 {
 				if e.myDir == DirRes { // SERVER OPTIMIZATION
@@ -429,6 +452,7 @@ func (e *Engine) pollLoop(ctx context.Context) {
 						return
 					}
 					defer rc.Close()
+					downloadDone := time.Now()
 
 					// Extract ClientID from filename for server-side session initialization
 					var fileClientID string
@@ -472,6 +496,7 @@ func (e *Engine) pollLoop(ctx context.Context) {
 
 						if s != nil {
 							s.ProcessRx(&env)
+							metrics.Global().RecordDownloadToRx(time.Since(downloadDone))
 						}
 					}
 
@@ -543,6 +568,7 @@ func (e *Engine) CloseAndFlush(ctx context.Context, id string) {
 func (e *Engine) RemoveSession(id string) {
 	e.sessionMu.Lock()
 	delete(e.sessions, id)
+	metrics.Global().SetActiveSessions(int64(len(e.sessions)))
 	e.sessionMu.Unlock()
 
 	// Add to tombstone list

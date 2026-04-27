@@ -18,6 +18,7 @@ type Session struct {
 	ID           string
 	mu           sync.Mutex
 	txBuf        []byte
+	txEnqueuedAt time.Time
 	txSeq        uint64
 	txInFlight   bool
 	rxSeq        uint64
@@ -60,8 +61,12 @@ func (s *Session) EnqueueTx(data []byte) {
 		s.txCond.Wait()
 	}
 
+	now := time.Now()
+	if len(s.txBuf) == 0 {
+		s.txEnqueuedAt = now
+	}
 	s.txBuf = append(s.txBuf, data...)
-	s.lastActivity = time.Now()
+	s.lastActivity = now
 	s.firstWritePending = false
 }
 

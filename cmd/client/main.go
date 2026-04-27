@@ -12,9 +12,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/NullLatency/flow-driver/internal/config"
 	"github.com/NullLatency/flow-driver/internal/httpclient"
+	"github.com/NullLatency/flow-driver/internal/metrics"
 	"github.com/NullLatency/flow-driver/internal/storage"
 	"github.com/NullLatency/flow-driver/internal/transport"
 	"github.com/things-go/go-socks5"
@@ -59,6 +61,7 @@ func main() {
 			log.Fatalf("Failed to init local storage: %v", err)
 		}
 	}
+	backend = storage.WithMetrics(backend)
 	if err := backend.Login(ctx); err != nil {
 		log.Fatalf("Backend login failed: %v", err)
 	}
@@ -101,6 +104,12 @@ func main() {
 		engine.SetFlushRate(appCfg.FlushRateMs)
 	}
 	engine.Start(ctx)
+
+	// Start metrics logging if configured
+	if appCfg.MetricsLogIntervalSec > 0 {
+		interval := time.Duration(appCfg.MetricsLogIntervalSec) * time.Second
+		metrics.Global().StartPeriodicLog(interval)
+	}
 
 	listenAddr := appCfg.ListenAddr
 	if listenAddr == "" {

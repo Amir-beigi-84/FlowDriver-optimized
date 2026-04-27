@@ -13,6 +13,7 @@ import (
 
 	"github.com/NullLatency/flow-driver/internal/config"
 	"github.com/NullLatency/flow-driver/internal/httpclient"
+	"github.com/NullLatency/flow-driver/internal/metrics"
 	"github.com/NullLatency/flow-driver/internal/storage"
 	"github.com/NullLatency/flow-driver/internal/transport"
 )
@@ -42,6 +43,7 @@ func main() {
 			log.Fatalf("Failed to init local storage: %v", err)
 		}
 	}
+	backend = storage.WithMetrics(backend)
 	if err := backend.Login(ctx); err != nil {
 		log.Fatalf("Backend login failed: %v", err)
 	}
@@ -87,6 +89,12 @@ func main() {
 	}
 
 	engine.Start(ctx)
+
+	// Start metrics logging if configured
+	if appCfg.MetricsLogIntervalSec > 0 {
+		interval := time.Duration(appCfg.MetricsLogIntervalSec) * time.Second
+		metrics.Global().StartPeriodicLog(interval)
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
