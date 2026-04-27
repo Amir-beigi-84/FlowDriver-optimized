@@ -294,7 +294,7 @@ func (b *GoogleBackend) ListQuery(ctx context.Context, prefix string) ([]string,
 		return nil, err
 	}
 
-	q := fmt.Sprintf("name contains %s and trashed = false", driveQueryLiteral(prefix))
+	q := fmt.Sprintf("name contains %s and trashed = false", driveQueryLiteral(driveListQueryTerm(prefix)))
 	if b.folderID != "" {
 		q += fmt.Sprintf(" and %s in parents", driveQueryLiteral(b.folderID))
 	}
@@ -382,6 +382,17 @@ func driveQueryLiteral(s string) string {
 	s = strings.ReplaceAll(s, "\\", "\\\\")
 	s = strings.ReplaceAll(s, "'", "\\'")
 	return "'" + s + "'"
+}
+
+func driveListQueryTerm(prefix string) string {
+	parts := strings.Split(prefix, "-")
+	if len(parts) >= 3 && parts[1] != "" {
+		return parts[1]
+	}
+	if len(parts) > 0 && parts[0] != "" {
+		return parts[0]
+	}
+	return prefix
 }
 
 func (b *GoogleBackend) Download(ctx context.Context, filename string) (io.ReadCloser, error) {
