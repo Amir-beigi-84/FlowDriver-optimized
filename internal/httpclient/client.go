@@ -61,9 +61,12 @@ func NewCustomClient(cfg TransportConfig) *http.Client {
 			InsecureSkipVerify: cfg.InsecureSkipVerify,
 		},
 		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   64,
+		MaxConnsPerHost:       64,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
