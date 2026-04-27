@@ -80,6 +80,7 @@ type Engine struct {
 
 	flushNow       chan struct{}
 	pollNow        chan struct{}
+	deleteQueue    chan string
 	flushCoalesce  time.Duration
 	firstOpenDelay time.Duration
 
@@ -112,6 +113,7 @@ func NewEngine(backend storage.Backend, isClient bool, clientID string) *Engine 
 		flushTicker:      300 * time.Millisecond,
 		flushNow:         make(chan struct{}, 1),
 		pollNow:          make(chan struct{}, 1),
+		deleteQueue:      make(chan string, 1024),
 		flushCoalesce:    10 * time.Millisecond,
 		firstOpenDelay:   25 * time.Millisecond,
 	}
@@ -208,6 +210,7 @@ func (e *Engine) wakePoll() {
 func (e *Engine) Start(ctx context.Context) {
 	go e.flushLoop(ctx)
 	go e.pollLoop(ctx)
+	go e.deleteLoop(ctx)
 	go e.cleanupLoop(ctx) // Delete files older than 10s
 }
 
@@ -231,6 +234,27 @@ func (e *Engine) RequestFlush() {
 	select {
 	case e.flushNow <- struct{}{}:
 	default:
+	}
+}
+
+func (e *Engine) enqueueDelete(filename string) {
+	select {
+	case e.deleteQueue <- filename:
+	default:
+		log.Printf("delete queue full, skipping delete for %s", filename)
+	}
+}
+
+func (e *Engine) deleteLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case filename := <-e.deleteQueue:
+			if err := e.backend.Delete(ctx, filename); err != nil {
+				log.Printf("delete error %s: %v", filename, err)
+			}
+		}
 	}
 }
 
@@ -486,7 +510,7 @@ func (e *Engine) pollLoop(ctx context.Context) {
 				tsStr = strings.TrimSuffix(tsStr, ".bin")
 				ts, _ := strconv.ParseInt(tsStr, 10, 64)
 				if ts > 0 && time.Since(time.Unix(0, ts)) > 5*time.Minute {
-					e.backend.Delete(ctx, f) // Silent cleanup
+					e.enqueueDelete(f)
 					continue
 				}
 			}
@@ -568,7 +592,7 @@ func (e *Engine) pollLoop(ctx context.Context) {
 					}
 				}
 
-				e.backend.Delete(ctx, fname)
+				e.enqueueDelete(fname)
 			}(f)
 		}
 
@@ -713,7 +737,7 @@ func (e *Engine) cleanupLoop(ctx context.Context) {
 					if err == nil {
 						t := time.Unix(0, ts)
 						if time.Since(t) > 10*time.Second {
-							e.backend.Delete(ctx, f)
+							e.enqueueDelete(f)
 						}
 					}
 				}
