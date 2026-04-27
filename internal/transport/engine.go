@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/NullLatency/flow-driver/internal/metrics"
@@ -73,8 +74,12 @@ type Engine struct {
 	// Adaptive polling: fast when active, slow when idle
 	pollTickerIdle   time.Duration
 	pollTickerActive time.Duration
+	pollIdleMax      time.Duration
+	activePollWindow time.Duration
+	activeUntil      atomic.Int64
 
 	flushNow      chan struct{}
+	pollNow       chan struct{}
 	flushCoalesce time.Duration
 
 	// Server mode handler: called when a new session is discovered
@@ -98,11 +103,14 @@ func NewEngine(backend storage.Backend, isClient bool, clientID string) *Engine 
 		closedSessions: make(map[string]time.Time),
 		processed:      make(map[string]bool),
 		// Default intervals
-		pollTicker:       500 * time.Millisecond,
-		pollTickerIdle:   500 * time.Millisecond,
-		pollTickerActive: 50 * time.Millisecond,
+		pollTicker:       time.Second,
+		pollTickerIdle:   time.Second,
+		pollTickerActive: 75 * time.Millisecond,
+		pollIdleMax:      5 * time.Second,
+		activePollWindow: 15 * time.Second,
 		flushTicker:      300 * time.Millisecond,
 		flushNow:         make(chan struct{}, 1),
+		pollNow:          make(chan struct{}, 1),
 		flushCoalesce:    20 * time.Millisecond,
 	}
 	if isClient {
@@ -119,9 +127,7 @@ func NewEngine(backend storage.Backend, isClient bool, clientID string) *Engine 
 
 func (e *Engine) SetRefreshRate(ms int) {
 	if ms > 0 {
-		e.pollTicker = time.Duration(ms) * time.Millisecond
-		e.pollTickerIdle = time.Duration(ms) * time.Millisecond
-		e.pollTickerActive = time.Duration(ms) / 5 * time.Millisecond
+		e.SetPollRate(ms)
 		// Legacy behavior: sets both if FlushTicker was still at default
 		if e.flushTicker == 300*time.Millisecond {
 			e.flushTicker = time.Duration(ms) * time.Millisecond
@@ -131,15 +137,57 @@ func (e *Engine) SetRefreshRate(ms int) {
 
 func (e *Engine) SetPollRate(ms int) {
 	if ms > 0 {
-		e.pollTicker = time.Duration(ms) * time.Millisecond
-		e.pollTickerIdle = time.Duration(ms) * time.Millisecond
-		e.pollTickerActive = time.Duration(ms) / 5 * time.Millisecond
+		idle := time.Duration(ms) * time.Millisecond
+		active := idle / 4
+		if active < 50*time.Millisecond {
+			active = 50 * time.Millisecond
+		}
+		if active > 100*time.Millisecond {
+			active = 100 * time.Millisecond
+		}
+		e.pollTicker = idle
+		e.pollTickerIdle = idle
+		e.pollTickerActive = active
+		e.pollIdleMax = idle
+	}
+}
+
+func (e *Engine) SetAdaptivePoll(idleMs, activeMs, activeWindowMs int) {
+	if idleMs > 0 {
+		e.pollTickerIdle = time.Duration(idleMs) * time.Millisecond
+		e.pollTicker = e.pollTickerIdle
+		e.pollIdleMax = 5 * time.Second
+	}
+	if activeMs > 0 {
+		e.pollTickerActive = time.Duration(activeMs) * time.Millisecond
+	}
+	if activeWindowMs > 0 {
+		e.activePollWindow = time.Duration(activeWindowMs) * time.Millisecond
 	}
 }
 
 func (e *Engine) SetFlushRate(ms int) {
 	if ms > 0 {
 		e.flushTicker = time.Duration(ms) * time.Millisecond
+	}
+}
+
+func (e *Engine) markActive() {
+	if e.activePollWindow > 0 {
+		e.activeUntil.Store(time.Now().Add(e.activePollWindow).UnixNano())
+	}
+	e.wakePoll()
+}
+
+func (e *Engine) recentlyActive() bool {
+	deadline := e.activeUntil.Load()
+	return deadline > 0 && time.Now().UnixNano() < deadline
+}
+
+func (e *Engine) wakePoll() {
+	select {
+	case e.pollNow <- struct{}{}:
+	default:
 	}
 }
 
@@ -160,10 +208,12 @@ func (e *Engine) AddSession(s *Session) {
 	defer e.sessionMu.Unlock()
 	e.sessions[s.ID] = s
 	metrics.Global().SetActiveSessions(int64(len(e.sessions)))
+	e.markActive()
 	log.Printf("Engine.AddSession: Added session %s (Total now: %d)", s.ID, len(e.sessions))
 }
 
 func (e *Engine) RequestFlush() {
+	e.markActive()
 	select {
 	case e.flushNow <- struct{}{}:
 	default:
@@ -316,6 +366,7 @@ func (e *Engine) uploadMux(ctx context.Context, filename string, mux []Envelope,
 		e.RequestFlush()
 		return
 	}
+	e.markActive()
 
 	hasMoreData := false
 
@@ -343,7 +394,6 @@ func (e *Engine) uploadMux(ctx context.Context, filename string, mux []Envelope,
 
 func (e *Engine) pollLoop(ctx context.Context) {
 	currentPollInterval := e.pollTicker
-	maxPollInterval := 5 * time.Second
 	timer := time.NewTimer(currentPollInterval)
 	defer timer.Stop()
 
@@ -352,167 +402,190 @@ func (e *Engine) pollLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-		pollAgain:
-			// ZERO-TRAFFIC CLIENT OPTIMIZATION:
-			// SOCKS5 only initiates from the Client. If the Client has 0 active sessions,
-			// it mathematically never needs to poll Google Drive! Go entirely to sleep!
-			if e.myDir == DirReq {
-				e.sessionMu.RLock()
-				count := len(e.sessions)
-				e.sessionMu.RUnlock()
-				if count == 0 {
-					timer.Reset(currentPollInterval)
+		case <-e.pollNow:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		}
+
+	pollAgain:
+		// ZERO-TRAFFIC CLIENT OPTIMIZATION:
+		// SOCKS5 only initiates from the Client. If the Client has 0 active sessions,
+		// it mathematically never needs to poll Google Drive! Go entirely to sleep!
+		if e.myDir == DirReq {
+			e.sessionMu.RLock()
+			count := len(e.sessions)
+			e.sessionMu.RUnlock()
+			if count == 0 {
+				currentPollInterval = nextIdlePollInterval(currentPollInterval, e.pollTickerIdle, e.pollIdleMax)
+				timer.Reset(currentPollInterval)
+				continue
+			}
+		}
+
+		// Fetch multiplexed files
+		prefix := string(e.peerDir) + "-"
+		if e.myDir == DirReq {
+			// Client only polls for its own responses
+			prefix += e.id + "-mux-"
+		} else {
+			// Server polls for ALL client requests
+			prefix += ""
+		}
+		files, err := e.backend.ListQuery(ctx, prefix)
+		if err != nil {
+			log.Printf("poll list error: %v", err)
+			timer.Reset(currentPollInterval)
+			continue
+		}
+
+		metrics.Global().RecordPoll(len(files))
+
+		if len(files) == 0 {
+			e.sessionMu.RLock()
+			activeSessions := len(e.sessions)
+			e.sessionMu.RUnlock()
+
+			if activeSessions > 0 || e.recentlyActive() {
+				currentPollInterval = e.pollTickerActive
+			} else {
+				currentPollInterval = nextIdlePollInterval(currentPollInterval, e.pollTickerIdle, e.pollIdleMax)
+			}
+			timer.Reset(currentPollInterval)
+			continue
+		}
+
+		// We found data! Reset polling back to maximum speed
+		e.markActive()
+		currentPollInterval = e.pollTickerActive
+
+		// We found files! Let's download them in parallel to boost speed massively
+		var wg sync.WaitGroup
+		for _, f := range files {
+			// STARTUP OPTIMIZATION: Ignore files older than 5 minutes to avoid memory spikes on restart
+			parts := strings.Split(f, "-")
+			if len(parts) >= 3 {
+				tsStr := parts[len(parts)-1]
+				tsStr = strings.TrimSuffix(tsStr, ".bin")
+				ts, _ := strconv.ParseInt(tsStr, 10, 64)
+				if ts > 0 && time.Since(time.Unix(0, ts)) > 5*time.Minute {
+					e.backend.Delete(ctx, f) // Silent cleanup
 					continue
 				}
 			}
 
-			// Fetch multiplexed files
-			prefix := string(e.peerDir) + "-"
-			if e.myDir == DirReq {
-				// Client only polls for its own responses
-				prefix += e.id + "-mux-"
-			} else {
-				// Server polls for ALL client requests
-				prefix += ""
+			e.processedMu.Lock()
+			already := e.processed[f]
+			if !already {
+				e.processed[f] = true
 			}
-			files, err := e.backend.ListQuery(ctx, prefix)
-			if err != nil {
-				log.Printf("poll list error: %v", err)
-				timer.Reset(currentPollInterval)
+			e.processedMu.Unlock()
+
+			if already {
 				continue
 			}
 
-			metrics.Global().RecordPoll(len(files))
+			wg.Add(1)
+			go func(fname string) {
+				defer wg.Done()
 
-			if len(files) == 0 {
-				if e.myDir == DirRes { // SERVER OPTIMIZATION
-					e.sessionMu.RLock()
-					activeSessions := len(e.sessions)
-					e.sessionMu.RUnlock()
+				e.sem <- struct{}{}        // Acquire
+				defer func() { <-e.sem }() // Release
 
-					if activeSessions == 0 {
-						// Increase polling delay step-by-step to save API calls
-						currentPollInterval = e.pollTickerIdle
-						if currentPollInterval > maxPollInterval {
-							currentPollInterval = maxPollInterval
-						}
-					} else {
-						// A session is currently active, so loop fast!
-						currentPollInterval = e.pollTickerActive
-					}
+				// log.Printf("Engine.pollLoop: Downloading %s", fname)
+				rc, err := e.backend.Download(ctx, fname)
+				if err != nil {
+					log.Printf("download error %s: %v", fname, err)
+					e.processedMu.Lock()
+					delete(e.processed, fname) // failed to download, retry next poll
+					e.processedMu.Unlock()
+					return
 				}
-				// Client optimization doesn't change intervals, but needs its timer reset
-				timer.Reset(currentPollInterval)
-				continue
-			}
+				e.markActive()
+				defer rc.Close()
+				downloadDone := time.Now()
 
-			// We found data! Reset polling back to maximum speed
-			currentPollInterval = e.pollTickerActive
+				// Extract ClientID from filename for server-side session initialization
+				var fileClientID string
+				parts := strings.Split(fname, "-")
+				if len(parts) >= 4 && parts[2] == "mux" {
+					fileClientID = parts[1]
+				}
 
-			// We found files! Let's download them in parallel to boost speed massively
-			var wg sync.WaitGroup
-			for _, f := range files {
-				// STARTUP OPTIMIZATION: Ignore files older than 5 minutes to avoid memory spikes on restart
-				parts := strings.Split(f, "-")
-				if len(parts) >= 3 {
-					tsStr := parts[len(parts)-1]
-					tsStr = strings.TrimSuffix(tsStr, ".bin")
-					ts, _ := strconv.ParseInt(tsStr, 10, 64)
-					if ts > 0 && time.Since(time.Unix(0, ts)) > 5*time.Minute {
-						e.backend.Delete(ctx, f) // Silent cleanup
+				// STREAMING DECODE
+				count := 0
+				for {
+					var env Envelope
+					if err := env.Decode(rc); err != nil {
+						if err != io.EOF && err != io.ErrUnexpectedEOF {
+							log.Printf("mux decode error %s: %v", fname, err)
+						}
+						break
+					}
+					count++
+
+					// Process envelope immediately
+					e.closedSessionsMu.Lock()
+					if _, exists := e.closedSessions[env.SessionID]; exists {
+						e.closedSessionsMu.Unlock()
 						continue
 					}
-				}
+					e.closedSessionsMu.Unlock()
 
-				e.processedMu.Lock()
-				already := e.processed[f]
-				if !already {
-					e.processed[f] = true
-				}
-				e.processedMu.Unlock()
-
-				if already {
-					continue
-				}
-
-				wg.Add(1)
-				go func(fname string) {
-					defer wg.Done()
-
-					e.sem <- struct{}{}        // Acquire
-					defer func() { <-e.sem }() // Release
-
-					// log.Printf("Engine.pollLoop: Downloading %s", fname)
-					rc, err := e.backend.Download(ctx, fname)
-					if err != nil {
-						log.Printf("download error %s: %v", fname, err)
-						e.processedMu.Lock()
-						delete(e.processed, fname) // failed to download, retry next poll
-						e.processedMu.Unlock()
-						return
-					}
-					defer rc.Close()
-					downloadDone := time.Now()
-
-					// Extract ClientID from filename for server-side session initialization
-					var fileClientID string
-					parts := strings.Split(fname, "-")
-					if len(parts) >= 4 && parts[2] == "mux" {
-						fileClientID = parts[1]
+					e.sessionMu.Lock()
+					s, exists := e.sessions[env.SessionID]
+					if !exists && e.myDir == DirRes && e.OnNewSession != nil {
+						s = NewSession(env.SessionID)
+						s.ClientID = fileClientID
+						e.sessions[env.SessionID] = s
+						e.sessionMu.Unlock()
+						log.Printf("Engine: Triggering new session %s for Client %s", env.SessionID, fileClientID)
+						e.OnNewSession(env.SessionID, env.TargetAddr, s)
+					} else {
+						e.sessionMu.Unlock()
 					}
 
-					// STREAMING DECODE
-					count := 0
-					for {
-						var env Envelope
-						if err := env.Decode(rc); err != nil {
-							if err != io.EOF && err != io.ErrUnexpectedEOF {
-								log.Printf("mux decode error %s: %v", fname, err)
-							}
-							break
-						}
-						count++
-
-						// Process envelope immediately
-						e.closedSessionsMu.Lock()
-						if _, exists := e.closedSessions[env.SessionID]; exists {
-							e.closedSessionsMu.Unlock()
-							continue
-						}
-						e.closedSessionsMu.Unlock()
-
-						e.sessionMu.Lock()
-						s, exists := e.sessions[env.SessionID]
-						if !exists && e.myDir == DirRes && e.OnNewSession != nil {
-							s = NewSession(env.SessionID)
-							s.ClientID = fileClientID
-							e.sessions[env.SessionID] = s
-							e.sessionMu.Unlock()
-							log.Printf("Engine: Triggering new session %s for Client %s", env.SessionID, fileClientID)
-							e.OnNewSession(env.SessionID, env.TargetAddr, s)
-						} else {
-							e.sessionMu.Unlock()
-						}
-
-						if s != nil {
-							s.ProcessRx(&env)
-							metrics.Global().RecordDownloadToRx(time.Since(downloadDone))
-						}
+					if s != nil {
+						s.ProcessRx(&env)
+						metrics.Global().RecordDownloadToRx(time.Since(downloadDone))
 					}
+				}
 
-					e.backend.Delete(ctx, fname)
-				}(f)
-			}
-
-			// Wait for parallel batch to finish
-			wg.Wait()
-
-			// Adaptive Polling: Because we just received data, the connection is active.
-			// Instead of jumping back to the select, immediately poll again after a tiny 100ms break to drain queues.
-			time.Sleep(5 * time.Millisecond)
-			goto pollAgain
+				e.backend.Delete(ctx, fname)
+			}(f)
 		}
+
+		// Wait for parallel batch to finish
+		wg.Wait()
+
+		// Adaptive Polling: Because we just received data, the connection is active.
+		// Instead of jumping back to the select, immediately poll again after a tiny 100ms break to drain queues.
+		time.Sleep(5 * time.Millisecond)
+		goto pollAgain
 	}
+}
+
+func nextIdlePollInterval(current, idle, max time.Duration) time.Duration {
+	if idle <= 0 {
+		idle = time.Second
+	}
+	if max <= 0 {
+		max = 5 * time.Second
+	}
+	if current < idle {
+		return idle
+	}
+	next := current * 2
+	if next < idle {
+		next = idle
+	}
+	if next > max {
+		next = max
+	}
+	return next
 }
 
 // CloseSession marks session closed and triggers immediate flush.

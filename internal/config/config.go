@@ -28,6 +28,15 @@ type AppConfig struct {
 	// RefreshRateMs is the polling (RX) interval in milliseconds for the engine.
 	RefreshRateMs int `json:"refresh_rate_ms,omitempty"`
 
+	// PollIdleMs is the polling interval when no recent activity exists.
+	PollIdleMs int `json:"poll_idle_ms,omitempty"`
+
+	// PollActiveMs is the polling interval while sessions or recent traffic are active.
+	PollActiveMs int `json:"poll_active_ms,omitempty"`
+
+	// ActivePollWindowMs keeps active polling enabled after recent traffic.
+	ActivePollWindowMs int `json:"active_poll_window_ms,omitempty"`
+
 	// FlushRateMs is the gathering (TX) interval in milliseconds for the engine.
 	FlushRateMs int `json:"flush_rate_ms,omitempty"`
 

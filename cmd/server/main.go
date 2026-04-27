@@ -78,6 +78,7 @@ func main() {
 	if appCfg.RefreshRateMs > 0 {
 		engine.SetPollRate(appCfg.RefreshRateMs)
 	}
+	engine.SetAdaptivePoll(appCfg.PollIdleMs, appCfg.PollActiveMs, appCfg.ActivePollWindowMs)
 	if appCfg.FlushRateMs > 0 {
 		engine.SetFlushRate(appCfg.FlushRateMs)
 	}

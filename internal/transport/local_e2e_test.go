@@ -34,8 +34,8 @@ func TestLocalEngineEndToEnd(t *testing.T) {
 
 	// Keep test fast. Event-driven flush should do most of the work,
 	// but fast polling makes the local backend E2E test deterministic.
-	clientEngine.pollTicker = 10 * time.Millisecond
-	serverEngine.pollTicker = 10 * time.Millisecond
+	clientEngine.SetAdaptivePoll(10, 10, 1000)
+	serverEngine.SetAdaptivePoll(10, 10, 1000)
 	clientEngine.flushTicker = time.Hour
 	serverEngine.flushTicker = time.Hour
 	clientEngine.flushCoalesce = time.Millisecond
