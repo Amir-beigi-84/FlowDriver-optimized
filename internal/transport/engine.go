@@ -78,9 +78,10 @@ type Engine struct {
 	activePollWindow time.Duration
 	activeUntil      atomic.Int64
 
-	flushNow      chan struct{}
-	pollNow       chan struct{}
-	flushCoalesce time.Duration
+	flushNow       chan struct{}
+	pollNow        chan struct{}
+	flushCoalesce  time.Duration
+	firstOpenDelay time.Duration
 
 	// Server mode handler: called when a new session is discovered
 	OnNewSession func(sessionID, targetAddr string, s *Session)
@@ -112,6 +113,7 @@ func NewEngine(backend storage.Backend, isClient bool, clientID string) *Engine 
 		flushNow:         make(chan struct{}, 1),
 		pollNow:          make(chan struct{}, 1),
 		flushCoalesce:    10 * time.Millisecond,
+		firstOpenDelay:   25 * time.Millisecond,
 	}
 	if isClient {
 		e.myDir = DirReq
@@ -175,6 +177,12 @@ func (e *Engine) SetFlushRate(ms int) {
 func (e *Engine) SetFlushCoalesce(ms int) {
 	if ms > 0 {
 		e.flushCoalesce = time.Duration(ms) * time.Millisecond
+	}
+}
+
+func (e *Engine) SetFirstOpenDelay(ms int) {
+	if ms > 0 {
+		e.firstOpenDelay = time.Duration(ms) * time.Millisecond
 	}
 }
 
@@ -289,7 +297,7 @@ func (e *Engine) flushAll(ctx context.Context) {
 			shouldSend = true
 		} else if s.txSeq == 0 && e.myDir == DirReq {
 			// Only send empty open if first write hasn't arrived within delay window
-			if !s.firstWritePending || time.Since(s.lastActivity) > 25*time.Millisecond {
+			if !s.firstWritePending || time.Since(s.lastActivity) > e.firstOpenDelay {
 				shouldSend = true
 			}
 		}

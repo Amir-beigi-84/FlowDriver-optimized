@@ -107,6 +107,9 @@ func main() {
 	if appCfg.FlushCoalesceMs > 0 {
 		engine.SetFlushCoalesce(appCfg.FlushCoalesceMs)
 	}
+	if appCfg.FirstOpenDelayMs > 0 {
+		engine.SetFirstOpenDelay(appCfg.FirstOpenDelayMs)
+	}
 	engine.Start(ctx)
 
 	// Start metrics logging if configured

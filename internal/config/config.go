@@ -43,6 +43,9 @@ type AppConfig struct {
 	// FlushCoalesceMs is the short write-burst coalescing delay before event-driven flush.
 	FlushCoalesceMs int `json:"flush_coalesce_ms,omitempty"`
 
+	// FirstOpenDelayMs waits briefly for first payload before sending an empty open.
+	FirstOpenDelayMs int `json:"first_open_delay_ms,omitempty"`
+
 	// MetricsLogIntervalSec is the interval for periodic metrics logging (0 = disabled).
 	MetricsLogIntervalSec int `json:"metrics_log_interval_sec,omitempty"`
 

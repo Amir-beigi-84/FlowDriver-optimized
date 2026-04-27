@@ -85,6 +85,9 @@ func main() {
 	if appCfg.FlushCoalesceMs > 0 {
 		engine.SetFlushCoalesce(appCfg.FlushCoalesceMs)
 	}
+	if appCfg.FirstOpenDelayMs > 0 {
+		engine.SetFirstOpenDelay(appCfg.FirstOpenDelayMs)
+	}
 
 	// Called by polling loop when a new incoming session file is found
 	engine.OnNewSession = func(sessionID, targetAddr string, session *transport.Session) {
